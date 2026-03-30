@@ -1,0 +1,127 @@
+import type { ProfitCalculation, JudgmentResult, ProductInfo } from '@/types';
+import { formatJPY, formatPercent } from './profit-calculator';
+
+// ─────────────────────────────────────────────
+// 判定閾値（ここを変えるだけで判定基準を調整できる）
+// ─────────────────────────────────────────────
+const THRESHOLDS = {
+  GO: {
+    minProfit: 3000,  // 円
+    minRate: 20,      // %
+  },
+  CAUTION: {
+    minProfit: 1000,  // 円
+    minRate: 10,      // %
+  },
+};
+
+/**
+ * 仕入れ判定（純粋関数）
+ */
+export function judge(
+  calc: ProfitCalculation,
+  product: ProductInfo
+): JudgmentResult {
+  const warnings: string[] = [];
+
+  // ── NEED MORE INFO チェック ──────────────────
+  const missingFields: string[] = [];
+  if (!product.name.trim() && !product.brand.trim()) {
+    missingFields.push('商品名またはブランド');
+  }
+  if (calc.sellingPrice <= 0) {
+    missingFields.push('eBay販売想定価格');
+  }
+  if (calc.breakdown.purchasePrice <= 0) {
+    missingFields.push('仕入れ価格');
+  }
+
+  if (missingFields.length > 0) {
+    return {
+      judgment: 'NEED_MORE_INFO',
+      reasons: [
+        `以下の情報が未入力です: ${missingFields.join('、')}`,
+        '必須項目を入力してから再度判定してください。',
+      ],
+      warnings: [],
+    };
+  }
+
+  // ── 警告チェック ─────────────────────────────
+  const { breakdown, sellingPrice } = calc;
+
+  if (breakdown.ebayFee / sellingPrice > 0.15) {
+    warnings.push('eBay手数料が販売価格の15%を超えています（カテゴリを確認してください）');
+  }
+  if (breakdown.internationalShipping > sellingPrice * 0.3) {
+    warnings.push('国際送料が販売価格の30%を超えています（小型・軽量商品を優先してください）');
+  }
+  if (breakdown.purchasePrice > sellingPrice * 0.6) {
+    warnings.push('仕入れ価格が販売価格の60%を超えています（利益の余地が少ないです）');
+  }
+  if (calc.profitRate < 0) {
+    warnings.push('為替変動・返品が発生した場合、損失がさらに拡大します');
+  }
+
+  // ── メイン判定 ───────────────────────────────
+  const { profit, profitRate } = calc;
+
+  if (profit >= THRESHOLDS.GO.minProfit && profitRate >= THRESHOLDS.GO.minRate) {
+    return {
+      judgment: 'GO',
+      reasons: [
+        `利益額 ${formatJPY(profit)} ✓（基準: ${formatJPY(THRESHOLDS.GO.minProfit)} 以上）`,
+        `利益率 ${formatPercent(profitRate)} ✓（基準: ${THRESHOLDS.GO.minRate}% 以上）`,
+        'すべての判定基準をクリアしています。仕入れを検討してください。',
+      ],
+      warnings,
+    };
+  }
+
+  if (profit >= THRESHOLDS.CAUTION.minProfit && profitRate >= THRESHOLDS.CAUTION.minRate) {
+    const profitGap = THRESHOLDS.GO.minProfit - profit;
+    const rateGap = THRESHOLDS.GO.minRate - profitRate;
+    const causeMessages: string[] = [];
+
+    if (profitGap > 0) {
+      causeMessages.push(`利益額が GO 基準まで ${formatJPY(profitGap)} 不足`);
+    }
+    if (rateGap > 0) {
+      causeMessages.push(`利益率が GO 基準まで ${formatPercent(rateGap)} 不足`);
+    }
+
+    return {
+      judgment: 'CAUTION',
+      reasons: [
+        `利益額 ${formatJPY(profit)}、利益率 ${formatPercent(profitRate)}`,
+        ...causeMessages,
+        '最低限の利益は出ますが、リスクが顕在化すると赤字になる可能性があります。',
+      ],
+      warnings,
+    };
+  }
+
+  // NO GO
+  const noGoReasons: string[] = [];
+  if (profit < 0) {
+    noGoReasons.push(`損失: ${formatJPY(Math.abs(profit))}（コストが販売価格を超えています）`);
+  } else {
+    if (profit < THRESHOLDS.CAUTION.minProfit) {
+      noGoReasons.push(
+        `利益額 ${formatJPY(profit)} が基準（${formatJPY(THRESHOLDS.CAUTION.minProfit)}）を下回っています`
+      );
+    }
+    if (profitRate < THRESHOLDS.CAUTION.minRate) {
+      noGoReasons.push(
+        `利益率 ${formatPercent(profitRate)} が基準（${THRESHOLDS.CAUTION.minRate}%）を下回っています`
+      );
+    }
+  }
+  noGoReasons.push('この条件での仕入れは推奨しません。仕入れ価格の交渉または販売価格の見直しを検討してください。');
+
+  return {
+    judgment: 'NO_GO',
+    reasons: noGoReasons,
+    warnings,
+  };
+}

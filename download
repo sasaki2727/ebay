@@ -1,0 +1,133 @@
+import { NextRequest, NextResponse } from 'next/server';
+
+// App Router: リクエストボディサイズ上限を 10MB に設定
+export const config = {
+  api: { bodyParser: { sizeLimit: '10mb' } },
+};
+
+// Claudeへの商品解析プロンプト
+const VISION_PROMPT = `この画像に写っている商品を詳しく分析してください。
+以下のJSON形式のみで回答してください（説明文・コードブロック不要）。
+不明な項目は空文字列またはデフォルト値を使用してください。
+
+{
+  "brand": "ブランド名（例: Apple, Sony, SEIKO。不明なら空文字）",
+  "name": "商品名（例: iPhone 13 Pro 256GB, ロレックス デイトナ Ref.116500LN）",
+  "modelNumber": "型番・品番（例: MGTF3J/A, Ref.116500LN。不明なら空文字）",
+  "condition": "状態（new/like_new/very_good/good/acceptable/for_parts のいずれか）",
+  "accessories": "確認できる付属品（例: 充電ケーブル, ACアダプター, 説明書）",
+  "hasBox": false,
+  "memo": "商品の特記事項（傷・汚れ・特徴など。なければ空文字）",
+  "confidence": 0.85
+}
+
+conditionの目安:
+- new: 未使用・未開封
+- like_new: ほぼ新品・使用感なし
+- very_good: 軽微な使用感のみ
+- good: 通常使用の傷あり
+- acceptable: 目立つ傷・汚れあり
+- for_parts: 動作不良・ジャンク品`;
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { imageBase64, mimeType } = body;
+
+    if (!imageBase64) {
+      return NextResponse.json({ error: 'imageBase64 is required' }, { status: 400 });
+    }
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+
+    // ── APIキー未設定時 → モック応答 ──────────────
+    if (!apiKey) {
+      return NextResponse.json({
+        brand: '',
+        name: '',
+        modelNumber: '',
+        condition: 'good',
+        accessories: '',
+        hasBox: false,
+        memo: '⚠️ Claude Vision APIキーが未設定です。商品情報を手動で入力してください。(.env.local に ANTHROPIC_API_KEY を設定すると自動解析が有効になります)',
+        confidence: 0,
+        isMock: true,
+      });
+    }
+
+    // ── Claude Vision API 呼び出し ─────────────────
+    const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-opus-4-5',
+        max_tokens: 1024,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: mimeType || 'image/jpeg',
+                  data: imageBase64,
+                },
+              },
+              {
+                type: 'text',
+                text: VISION_PROMPT,
+              },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!claudeResponse.ok) {
+      const errorText = await claudeResponse.text();
+      throw new Error(`Claude API error ${claudeResponse.status}: ${errorText}`);
+    }
+
+    const claudeData = await claudeResponse.json();
+    const rawText: string = claudeData.content?.[0]?.text ?? '{}';
+
+    // JSONを抽出してパース
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('ClaudeのレスポンスからJSONを抽出できませんでした');
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+
+    return NextResponse.json({
+      brand: parsed.brand ?? '',
+      name: parsed.name ?? '',
+      modelNumber: parsed.modelNumber ?? '',
+      condition: parsed.condition ?? 'good',
+      accessories: parsed.accessories ?? '',
+      hasBox: parsed.hasBox ?? false,
+      memo: parsed.memo ?? '',
+      confidence: parsed.confidence ?? 0.5,
+      isMock: false,
+    });
+  } catch (error) {
+    console.error('[analyze-image] Error:', error);
+    return NextResponse.json({
+      brand: '',
+      name: '',
+      modelNumber: '',
+      condition: 'good',
+      accessories: '',
+      hasBox: false,
+      memo: `画像解析エラー: ${error instanceof Error ? error.message : '不明なエラー'}`,
+      confidence: 0,
+      isMock: true,
+      error: true,
+    });
+  }
+}
